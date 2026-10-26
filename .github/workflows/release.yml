@@ -1,0 +1,234 @@
+name: Release desktop apps
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        default: v0.2.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+  CARGO_PROFILE_RELEASE_STRIP: 'true'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Check release version
+        id: version
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const version = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const tauriVersion = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+          const cargoVersion = fs.readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+          if (!/^\d+\.\d+\.\d+$/.test(version) || process.env.RELEASE_TAG !== `v${version}` || tauriVersion !== version || cargoVersion !== version) {
+            throw new Error('Release tag, package.json, Cargo.toml, and Tauri versions must match.');
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          NODE
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x64
+            bundles: nsis
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            bundles: deb,appimage
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+            bundles: dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: macos-x64
+            bundles: dmg
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      APP_VERSION: ${{ needs.prepare.outputs.version }}
+      BUILD_TARGET: ${{ matrix.target }}
+      BUILD_PLATFORM: ${{ matrix.platform }}
+      BUILD_BUNDLES: ${{ matrix.bundles }}
+      APPLE_SIGNING_IDENTITY: '-'
+      NO_STRIP: '1'
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Install Linux build and media dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils libfuse2 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target "$BUILD_TARGET"
+          rustup default stable
+      - name: Use neutral source paths in compiled files
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const home = os.homedir();
+          const paths = [
+            [home, '/builder'],
+            [process.env.CARGO_HOME || path.join(home, '.cargo'), '/cargo'],
+            [process.env.RUSTUP_HOME || path.join(home, '.rustup'), '/rustup'],
+            [process.env.GITHUB_WORKSPACE, '/src/myboards'],
+          ];
+          const flags = [...new Set(paths.flatMap(([from, to]) => [
+            `--remap-path-prefix=${from}=${to}`,
+            `--remap-path-prefix=${from.replaceAll('\\', '/')}=${to}`,
+          ]))];
+          if (process.platform === 'win32') flags.push('-C', 'link-arg=/PDBALTPATH:myboards.pdb');
+          fs.appendFileSync(process.env.GITHUB_ENV, `CARGO_ENCODED_RUSTFLAGS=${flags.join('\x1f')}\n`);
+          NODE
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build desktop packages
+        shell: bash
+        run: npm run tauri -- build --ci --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" -- --locked
+      - name: Check compiled application for local profile paths
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const filename = process.platform === 'win32' ? 'myboards.exe' : 'myboards';
+          const bytes = fs.readFileSync(path.join('src-tauri', 'target', process.env.BUILD_TARGET, 'release', filename));
+          const profile = /(?:[a-z]:[\\/]+Users[\\/]+[^\\/\s\0"']+|\/Users\/[^/\s\0"']+|\/home\/[^/\s\0"']+)/i;
+          const utf16be = Buffer.from(bytes.subarray(0, bytes.length - bytes.length % 2)).swap16().toString('utf16le');
+          if ([bytes.toString('utf8'), bytes.toString('utf16le'), utf16be].some(text => profile.test(text))) {
+            throw new Error('A local profile path remains in the compiled application. Release blocked.');
+          }
+          NODE
+      - name: Collect application files
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const root = path.join('src-tauri', 'target', process.env.BUILD_TARGET, 'release');
+          const prefix = `MyBoards-${process.env.APP_VERSION}-${process.env.BUILD_PLATFORM}`;
+          fs.mkdirSync('release-assets', { recursive: true });
+          const copy = (source, name) => fs.copyFileSync(source, path.join('release-assets', name));
+          const bundle = (kind, suffix, name) => {
+            const directory = path.join(root, 'bundle', kind);
+            const files = fs.readdirSync(directory).filter(file => file.endsWith(suffix));
+            if (files.length !== 1) throw new Error(`Expected one ${kind} package; found ${files.length}.`);
+            copy(path.join(directory, files[0]), name);
+          };
+          if (process.platform === 'win32') {
+            copy(path.join(root, 'myboards.exe'), `${prefix}.exe`);
+            bundle('nsis', '.exe', `${prefix}-setup.exe`);
+          } else if (process.platform === 'darwin') {
+            bundle('dmg', '.dmg', `${prefix}.dmg`);
+          } else {
+            bundle('deb', '.deb', `${prefix}.deb`);
+            bundle('appimage', '.AppImage', `${prefix}.AppImage`);
+          }
+          NODE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+          sparse-checkout: RELEASE_NOTES.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify complete package set and create checksums
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const version = process.env.APP_VERSION;
+          const expected = [
+            `MyBoards-${version}-windows-x64.exe`,
+            `MyBoards-${version}-windows-x64-setup.exe`,
+            `MyBoards-${version}-linux-x64.deb`,
+            `MyBoards-${version}-linux-x64.AppImage`,
+            `MyBoards-${version}-macos-arm64.dmg`,
+            `MyBoards-${version}-macos-x64.dmg`,
+          ].sort();
+          const actual = fs.readdirSync('release-assets').sort();
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Release assets are incomplete or unexpected.');
+          const checksums = expected.map(file => {
+            const bytes = fs.readFileSync(`release-assets/${file}`);
+            if (!bytes.length) throw new Error(`Empty package: ${file}`);
+            return `${crypto.createHash('sha256').update(bytes).digest('hex')}  ${file}`;
+          });
+          fs.writeFileSync('release-assets/SHA256SUMS.txt', `${checksums.join('\n')}\n`);
+          NODE
+      - name: Publish the complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > existing-release.txt 2>/dev/null; then
+            if [ "$(cat existing-release.txt)" != true ]; then
+              echo 'This release is already published; refusing to replace it.' >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "MyBoards $RELEASE_TAG" --notes-file RELEASE_NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest

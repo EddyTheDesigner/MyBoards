@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Core local-window APIs for the MyBoards canvas.",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:window:allow-destroy", "core:window:allow-set-theme", "dialog:allow-open"]
+}
